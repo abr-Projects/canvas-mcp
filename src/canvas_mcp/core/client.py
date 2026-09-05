@@ -33,6 +33,19 @@ def _canvas_auth_headers(api_token: str) -> dict[str, str]:
         "User-Agent": f"canvas-mcp/{__version__} (https://github.com/vishalsachdev/canvas-mcp)",
     }
 
+
+async def _canvas_auth_headers_async() -> dict[str, str]:
+    """Build Canvas auth headers using the token manager (async).
+
+    In oauth2 mode, this refreshes the token if needed.
+    In static mode, behaves identically to _canvas_auth_headers.
+    """
+    from .token_manager import get_valid_token
+
+    token = await get_valid_token()
+    return _canvas_auth_headers(token)
+
+
 def _resolve_canvas_api_root(base_api_url: str, api_root: Literal["rest", "quiz"]) -> str:
     """Resolve a configured ``…/api/v<N>`` base URL to a selected Canvas API root.
 
@@ -349,6 +362,8 @@ def _get_http_client() -> httpx.AsyncClient:
     if http_client is None:
         from .config import get_config
         config = get_config()
+        # Use static token for initial client creation; OAuth2 tokens are
+        # refreshed per-request via _canvas_auth_headers_async()
         http_client = httpx.AsyncClient(
             headers=_canvas_auth_headers(config.canvas_api_token),
             timeout=config.api_timeout
@@ -489,6 +504,11 @@ async def make_canvas_request(
     # Gate outbound calls with concurrency semaphore (uses MAX_CONCURRENT_REQUESTS)
     semaphore = _get_request_semaphore()
     async with semaphore:
+        # For OAuth2 mode, refresh token and set headers per-request
+        if config.auth_mode == "oauth2":
+            auth_headers = await _canvas_auth_headers_async()
+            client.headers.update(auth_headers)
+
         # Retry loop for rate limiting
         try:
             for attempt in range(MAX_RETRIES + 1):

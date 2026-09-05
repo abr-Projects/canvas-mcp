@@ -343,6 +343,15 @@ class Config:
         self.course_agent_policy_allow_ttl = _int_env("COURSE_AGENT_POLICY_ALLOW_TTL", 30)
         self.course_agent_policy_deny_ttl = _int_env("COURSE_AGENT_POLICY_DENY_TTL", 300)
 
+        # --- OAuth2 token refresh (optional) ---
+        # When CANVAS_AUTH_MODE=oauth2, the server uses client credentials
+        # flow to obtain and refresh access tokens automatically.
+        self.auth_mode = os.getenv("CANVAS_AUTH_MODE", "static").lower()
+        self.client_id = os.getenv("CANVAS_CLIENT_ID")
+        self.client_secret = os.getenv("CANVAS_CLIENT_SECRET")
+        self.refresh_token = os.getenv("CANVAS_REFRESH_TOKEN")
+        self.oauth_token_url = os.getenv("CANVAS_OAUTH_TOKEN_URL")
+
 
 # Global configuration instance
 _config: Config | None = None
