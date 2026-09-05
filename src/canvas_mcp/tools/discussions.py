@@ -25,6 +25,65 @@ from ..core.write_confirmation import (
     unconfirmed_write_warning,
 )
 
+
+async def _graphql_request(query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    """Make a GraphQL request to the Canvas API.
+
+    Args:
+        query: GraphQL query string
+        variables: Query variables
+
+    Returns:
+        GraphQL response data
+
+    Raises:
+        RuntimeError: If the request fails or GraphQL is not enabled
+    """
+    import re as _re
+
+    import httpx
+
+    from ..core.client import _canvas_auth_headers
+    from ..core.config import get_config
+    from ..core.token_manager import get_valid_token
+
+    config = get_config()
+
+    if not config.graphql_enabled:
+        raise RuntimeError("GraphQL is not enabled")
+
+    url = config.graphql_endpoint
+    token = await get_valid_token()
+
+    try:
+        async with httpx.AsyncClient(timeout=config.api_timeout) as client:
+            import sys
+            print(f"[DEBUG] GraphQL URL: {url}", file=sys.stderr)
+            print(f"[DEBUG] Variables: {variables}", file=sys.stderr)
+            response = await client.post(
+                url,
+                json={"query": query, "variables": variables},
+                headers=_canvas_auth_headers(token),
+            )
+
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"GraphQL request failed (HTTP {response.status_code}): {response.text}"
+                )
+
+            data = response.json()
+
+            if "errors" in data:
+                error_messages = [e.get("message", "Unknown error") for e in data["errors"]]
+                raise RuntimeError(f"GraphQL errors: {'; '.join(error_messages)}")
+
+            return data.get("data", {})
+
+    except httpx.TimeoutException:
+        raise RuntimeError("GraphQL request timed out")
+    except httpx.RequestError as e:
+        raise RuntimeError(f"GraphQL request network error: {e}")
+
 # One guard per delete tool (#318); tokens are bound to the tool name, the
 # course, the exact target ids and the titles the preview displayed.
 _DELETE_ANNOUNCEMENT_GUARD = ConfirmationGuard(nothing_done="Nothing was deleted.")
@@ -74,6 +133,9 @@ def register_shared_discussion_tools(mcp: FastMCP) -> None:
         collection and are NOT included unless include_announcements=True.
         To list announcements on their own, use list_announcements instead.
 
+        When CANVAS_GRAPHQL_ENABLED=true, uses GraphQL API for institutions
+        requiring it.
+
         Args:
             course_identifier: Course code or Canvas ID
             include_announcements: Also list the course's announcements
@@ -81,7 +143,92 @@ def register_shared_discussion_tools(mcp: FastMCP) -> None:
                 labelled "Type: Announcement" or "Type: Discussion".
         """
         course_id = await get_course_id(course_identifier)
+        from ..core.config import get_config
+        config = get_config()
 
+        # Use GraphQL if enabled
+        if config.graphql_enabled:
+            query = """
+            query GetDiscussionTopics($courseID: ID!) {
+              courses(ids: [$courseID]) {
+                discussionsConnection {
+                  nodes {
+                    id
+                    _id
+                    title
+                    postedAt
+                    published
+                    isAnnouncement
+                    discussionEntriesConnection {
+                      nodes { id }
+                    }
+                    userCount
+                  }
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                }
+              }
+            }
+            """
+
+            variables = {
+                "courseID": str(course_id),
+            }
+
+            try:
+                data = await _graphql_request(query, variables)
+            except RuntimeError as e:
+                return f"Error fetching discussion topics via GraphQL: {e}"
+
+            courses_list = data.get("courses")
+            if not courses_list:
+                return f"Error: Course {course_identifier} not found or not accessible."
+
+            course_node = courses_list[0] if courses_list else None
+            if not course_node:
+                return f"Error: Course {course_identifier} not found or not accessible."
+
+            topics_data = course_node.get("discussionsConnection", {})
+            topics = topics_data.get("nodes", [])
+
+            if not topics:
+                return f"No discussion topics found for course {course_identifier}."
+
+            # Filter based on include_announcements
+            if not include_announcements:
+                topics = [t for t in topics if not t.get("isAnnouncement", False)]
+
+            if not topics:
+                return f"No discussion topics found for course {course_identifier}."
+
+            topics_info = []
+            for topic in topics:
+                # _id is the numeric Canvas ID; id is the base64 global ID
+                topic_id = topic.get("_id") or topic.get("id")
+                title = topic.get("title", "Untitled topic")
+                is_announcement = topic.get("isAnnouncement", False)
+                published = topic.get("published", False)
+                posted_at = format_date(topic.get("postedAt"))
+                entries_conn = topic.get("discussionEntriesConnection", {})
+                entries_count = len(entries_conn.get("nodes", []))
+                user_count = topic.get("userCount", 0)
+
+                topic_type = "Announcement" if is_announcement else "Discussion"
+                status = "Published" if published else "Unpublished"
+
+                topics_info.append(
+                    f"ID: {topic_id}\nType: {topic_type}\n"
+                    f"Title:\n{fence_untrusted(title, 'discussion topic title')}\n"
+                    f"Status: {status}\nPosted: {posted_at}\n"
+                    f"Entries: {entries_count}, Users: {user_count}\n"
+                )
+
+            course_display = await get_course_code(course_id) or course_identifier
+            return f"Discussion Topics for Course {course_display}:\n\n" + "\n".join(topics_info)
+
+        # REST fallback
         # Canvas serves discussions and announcements from the same endpoint but
         # as disjoint sets: the index excludes announcements unless
         # only_announcements=true, which then excludes ordinary discussions.
@@ -191,12 +338,119 @@ def register_shared_discussion_tools(mcp: FastMCP) -> None:
                                          topic_id: str | int) -> str:
         """Get detailed information about a specific discussion topic.
 
+        When CANVAS_GRAPHQL_ENABLED=true, uses GraphQL API for institutions
+        requiring it. This fetches topic details with entries
+        in a single query.
+
         Args:
             course_identifier: Course code or Canvas ID
             topic_id: Discussion topic ID
         """
         course_id = await get_course_id(course_identifier)
+        from ..core.config import get_config
+        config = get_config()
 
+        # Use GraphQL if enabled
+        if config.graphql_enabled:
+            query = """
+            query GetDiscussionTopic($discussionID: ID!, $perPage: Int!) {
+              legacyNode(_id: $discussionID, type: Discussion) {
+                ... on Discussion {
+                  id
+                  _id
+                  title
+                  message
+                  createdAt
+                  postedAt
+                  author {
+                    displayName: shortName
+                    avatarUrl
+                  }
+                  discussionEntriesConnection(first: $perPage) {
+                    nodes {
+                      id
+                      _id
+                      message
+                      createdAt
+                      author {
+                        displayName: shortName
+                        avatarUrl
+                      }
+                    }
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
+                  }
+                }
+              }
+            }
+            """
+
+            variables = {
+                "discussionID": str(topic_id),
+                "perPage": 50,
+            }
+
+            try:
+                data = await _graphql_request(query, variables)
+            except RuntimeError as e:
+                return f"Error fetching discussion via GraphQL: {e}"
+
+            node = data.get("legacyNode")
+            if not node:
+                return f"Error: Discussion topic {topic_id} not found or not accessible."
+
+            title = node.get("title", "Untitled")
+            message = node.get("message", "")
+            created_at = format_date(node.get("createdAt"))
+            posted_at = format_date(node.get("postedAt"))
+            author = node.get("author") or {}
+            author_name = author.get("displayName") or author.get("shortName", "Unknown author")
+
+            entries_data = node.get("discussionEntriesConnection", {})
+            entries = entries_data.get("nodes", [])
+            page_info = entries_data.get("pageInfo", {})
+            has_next = page_info.get("hasNextPage", False)
+
+            course_display = await get_course_code(course_id) or course_identifier
+
+            result = f"Discussion Details for Course {course_display}:\n\n"
+            result += f"Title:\n{fence_untrusted(title, 'discussion topic title')}\n"
+            result += f"Topic ID: {topic_id}\n"
+            result += f"Author: {fence_untrusted_inline(author_name, 'author name')}\n"
+            result += f"Created: {created_at}\n"
+            result += f"Posted: {posted_at}\n"
+            result += f"Total Entries: {len(entries)}"
+            if has_next:
+                result += " (more available)"
+            result += "\n"
+
+            if message:
+                result += f"\nContent:\n{fence_untrusted(message, 'discussion topic body')}\n"
+
+            if entries:
+                result += f"\nEntries ({len(entries)}):\n"
+                for i, entry in enumerate(entries, 1):
+                    entry_id = entry.get("id")
+                    entry_author = entry.get("author") or {}
+                    entry_author_name = entry_author.get("displayName") or entry_author.get("shortName", "Unknown user")
+                    entry_message = entry.get("message", "")
+                    entry_created = format_date(entry.get("createdAt"))
+
+                    result += f"\nEntry #{i} (ID: {entry_id}):\n"
+                    result += f"Author: {fence_untrusted_inline(entry_author_name, 'author name')}\n"
+                    result += f"Posted: {entry_created}\n"
+
+                    if entry_message:
+                        clean_msg = re.sub(r'<[^>]+>', '', entry_message)
+                        if len(clean_msg) > 300:
+                            clean_msg = clean_msg[:300] + "..."
+                        result += f"Content:\n{fence_untrusted(clean_msg, 'discussion entry by a course participant')}\n"
+
+            return result
+
+        # REST fallback
         response = await make_canvas_request(
             "get", f"/courses/{course_id}/discussion_topics/{topic_id}"
         )
