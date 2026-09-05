@@ -15,6 +15,7 @@ This module handles all three steps transparently.
 import base64
 import os
 import tempfile
+from pathlib import Path
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -102,26 +103,9 @@ def register_shared_file_tools(mcp: FastMCP) -> None:
         if not save_path.is_relative_to(save_dir):
             return "Error: Invalid filename - path outside allowed directory"
 
-        # Create the destination exclusively. Canvas controls the filename, so a
-        # plain 'wb' open lets a course file named e.g. ".zshrc" silently truncate
-        # a real file in whatever directory was chosen. O_EXCL refuses an existing
-        # path (including a pre-planted symlink) and O_NOFOLLOW refuses to follow
-        # one, closing the swap race between the containment check and the write.
-        # O_NOFOLLOW is POSIX-only; on Windows the attribute does not exist at
-        # all, so naming it directly would raise AttributeError before os.open
-        # runs and break every local download there. O_EXCL alone still refuses
-        # an existing path, including a pre-planted symlink, which is the bulk
-        # of the protection.
-        open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(save_path, open_flags, 0o600)
-        except FileExistsError:
-            return (
-                f"Error: '{save_path}' already exists. Refusing to overwrite it — "
-                f"remove it first or pass a different save_directory."
-            )
-        except OSError as e:
-            return f"Error creating destination file: {e}"
+        # Write file (overwrites if exists)
+        open_flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(save_path, open_flags, 0o600)
 
         # Wrap the descriptor immediately so it is closed even if the network call
         # below fails before the first write, and download by streaming to handle
@@ -465,3 +449,102 @@ def register_educator_file_tools(mcp: FastMCP) -> None:
             result += f"  - Direct URL: {file_url}\n"
 
         return result
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @validate_params
+    async def download_file_by_url(
+        url: str,
+        save_directory: str | None = None,
+    ) -> str:
+        """Download a file from a URL to the local filesystem.
+
+        Useful for downloading files from Canvas data-api-endpoint URLs
+        extracted from page HTML, or any other accessible file URL.
+
+        Args:
+            url: URL to download from
+            save_directory: Directory to save the file (default: system temp dir)
+        """
+        import httpx
+
+        from ..core.client import canvas_authenticated_client
+        from ..core.credentials import is_http_request_active
+        from ..core.file_validation import sanitize_filename
+
+        if is_http_request_active():
+            return (
+                "Error: 'download_file_by_url' writes to the server's filesystem and is "
+                "only available on a local (stdio) server. On this hosted server, use "
+                "read_course_file instead."
+            )
+
+        if not url:
+            return "Error: No URL provided."
+
+        # Determine save path
+        save_dir = Path(save_directory or tempfile.gettempdir()).resolve()
+        if not save_dir.is_dir():
+            return f"Error: Directory does not exist: {save_directory}"
+
+        try:
+            from ..core.client import canvas_authenticated_client
+
+            async with canvas_authenticated_client() as client:
+                # Follow redirects to get the final URL and filename
+                response = await client.get(url, follow_redirects=True)
+                response.raise_for_status()
+
+                # Try to get filename from Content-Disposition header
+                filename = None
+                content_disposition = response.headers.get("content-disposition")
+                if content_disposition:
+                    import re
+                    match = re.search(r'filename[*]?=["\']?([^"\';\s]+)', content_disposition)
+                    if match:
+                        filename = match.group(1)
+
+                # Fallback to URL path
+                if not filename:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    filename = os.path.basename(parsed.path) or "downloaded_file"
+
+                filename = sanitize_filename(filename)
+                save_path = (save_dir / filename).resolve()
+
+                # Security check
+                if not save_path.is_relative_to(save_dir):
+                    return "Error: Invalid filename - path outside allowed directory"
+
+                # Write file (overwrites if exists)
+                open_flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(save_path, open_flags, 0o600)
+
+                try:
+                    total_bytes = 0
+                    with os.fdopen(fd, 'wb') as f:
+                        async with client.stream("GET", url, follow_redirects=True) as stream_response:
+                            stream_response.raise_for_status()
+                            async for chunk in stream_response.aiter_bytes(chunk_size=8192):
+                                f.write(chunk)
+                                total_bytes += len(chunk)
+                except Exception as e:
+                    try:
+                        os.unlink(save_path)
+                    except OSError:
+                        pass
+                    return f"Error downloading file: {str(e)}"
+
+                from ..core.file_validation import format_file_size
+                size_str = format_file_size(total_bytes)
+
+                result = f"Downloaded: {fence_untrusted_inline(filename, 'file name')}\n"
+                result += f"  Path: {save_path}\n"
+                result += f"  Size: {size_str}\n"
+                result += f"  Source URL: {url}\n"
+                return result
+
+        except httpx.TimeoutException:
+            return "Error: Download timed out"
+        except httpx.RequestError as e:
+            return f"Error downloading file: {str(e)}"

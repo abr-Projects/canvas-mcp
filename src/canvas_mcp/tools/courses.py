@@ -778,3 +778,63 @@ def register_shared_content_tools(mcp: FastMCP) -> None:
             result += f"Published: {'Yes' if published else 'No'}\n\n"
 
         return result
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    @validate_params
+    async def get_page_content_with_files(course_identifier: str | int, page_url_or_id: str) -> str:
+        """Get page content AND extract data-api-endpoint URLs for embedded files.
+
+        Useful for finding downloadable files (PDFs, slides) embedded in Canvas
+        pages. Returns the page content plus extracted file URLs that can be
+        used with download_file_by_url.
+
+        Args:
+            course_identifier: Course code or Canvas ID
+            page_url_or_id: Page URL slug or page ID
+        """
+        course_id = await get_course_id(course_identifier)
+
+        response = await make_canvas_request("get", f"/courses/{course_id}/pages/{page_url_or_id}")
+
+        if "error" in response:
+            return f"Error fetching page content: {response['error']}"
+
+        title = response.get("title", "Untitled")
+        body = response.get("body", "")
+        published = response.get("published", False)
+
+        if not body:
+            return "This page has no content. Its title:\n" + fence_untrusted(
+                title, "page title"
+            )
+
+        course_display = await get_course_code(course_id) or course_identifier
+        status = "Published" if published else "Unpublished"
+
+        # Extract data-api-endpoint URLs from the page body
+        data_api_endpoints = re.findall(r'data-api-endpoint="(.*?)"', body)
+
+        # Extract embedded media
+        media = extract_embedded_media(body)
+
+        # Build result
+        result = f"Page Content for page '{page_url_or_id}' in Course {course_display} ({status}):\n\n"
+
+        # Title and body are page-author-controlled (issue 239)
+        untrusted = f"Title: {title}\n\n{body}"
+        result += fence_untrusted(untrusted, "page title and body")
+
+        # Add media inventory
+        if media:
+            result += f"\n\nEmbedded Media ({len(media)} items):\n"
+            for item in media:
+                result += f"  - {item['tag']}: {item['src'] or '(no src)'}\n"
+
+        # Add extracted data-api-endpoint URLs
+        if data_api_endpoints:
+            result += f"\n\nExtracted File URLs ({len(data_api_endpoints)} found):\n"
+            for i, url in enumerate(data_api_endpoints, 1):
+                result += f"  {i}. {url}\n"
+            result += "\nUse download_file_by_url() with these URLs to download the files.\n"
+
+        return result
