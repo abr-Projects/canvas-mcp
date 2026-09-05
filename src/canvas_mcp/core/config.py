@@ -352,6 +352,12 @@ class Config:
         self.refresh_token = os.getenv("CANVAS_REFRESH_TOKEN")
         self.oauth_token_url = os.getenv("CANVAS_OAUTH_TOKEN_URL")
 
+        # --- GraphQL API (optional) ---
+        # When CANVAS_GRAPHQL_ENABLED=true, discussion tools use the GraphQL
+        # For discussion tools, some institutions force GraphQL usage
+        self.graphql_enabled = _bool_env("CANVAS_GRAPHQL_ENABLED", False)
+        self.graphql_endpoint = os.getenv("CANVAS_GRAPHQL_ENDPOINT")
+
 
 # Global configuration instance
 _config: Config | None = None
