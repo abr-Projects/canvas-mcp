@@ -143,9 +143,16 @@ Content access tools available to all authenticated users.
 | `get_syllabus` | Full Syllabus tab content, untruncated (text/html/both) |
 | `list_pages` | Course pages |
 | `get_page_content` | Read page content |
+| `get_page_content_with_files` | Read page content AND extract data-api-endpoint URLs for embedded files |
+| `get_page_details` | Page metadata (title, URL, etc.) |
+| `get_front_page` | Get the front page of a course |
 | `update_page_settings` | Publish/unpublish, set front page, editing roles |
 | `bulk_update_pages` | Update multiple pages at once |
+| `create_page` | Create a new page (educator) |
+| `edit_page_content` | Edit page body content (educator) |
 | `list_modules` | List course modules |
+| `list_module_items` | List items in a specific module |
+| `get_course_structure` | Full module→items tree as JSON (one call) |
 | `create_module` | Create a new module |
 | `update_module` | Update module settings |
 | `delete_module` | Delete a module |
@@ -155,8 +162,18 @@ Content access tools available to all authenticated users.
 | `list_announcements` | Course announcements, and nothing else |
 | `list_discussion_topics` | Discussion forums (discussions only; set `include_announcements` to also list announcements) |
 | `list_discussion_entries` | Posts in a discussion |
+| `get_discussion_topic_details` | Full discussion topic with entries |
+| `get_discussion_entry_details` | Single discussion entry |
 | `post_discussion_entry` | Add a discussion post |
 | `reply_to_discussion_entry` | Reply to a post |
+| `list_course_files` | List files in a course |
+| `read_course_file` | Read a course file (returns URL for download) |
+| `download_course_file` | Download a course file by file ID |
+| `download_file_by_url` | Download any file by URL (supports data-api-endpoint URLs) |
+| `list_conversations` | List Canvas Inbox conversations |
+| `get_conversation_details` | Get a specific conversation with messages |
+| `list_users` | List users in a course |
+| `list_groups` | List groups in a course |
 
 ### Learning Designer Tools
 Course design, quality assurance, and WCAG-oriented accessibility review.
@@ -200,6 +217,8 @@ Advanced tools for bulk operations and custom logic.
 | Grade 10+ submissions | `bulk_grade_submissions` | Concurrent processing |
 | Grade 30+ with custom logic | `execute_typescript` | Keeps per-item processing out of the model's context |
 | Complex data processing | `execute_typescript` | Per-item processing stays in the local execution environment |
+| Find lecture slides | `get_course_structure` | Modules contain most course materials |
+| Download files | `download_file_by_url` | Works with data-api-endpoint URLs |
 
 ### Token Efficiency Decision Tree
 
@@ -214,6 +233,49 @@ Is it a simple query?
 ```
 
 ## Common Workflows
+
+### Getting Lecture Slides and Course Materials
+
+**IMPORTANT:** Not all courses use Pages for lecture slides. Many courses store lecture materials in **Modules**. Always check modules first.
+
+#### Workflow: Find and read lecture slides from modules
+```
+1. Get course structure (one call gets everything)
+   → get_course_structure(course_id)
+   Returns: all modules with their items, including File and Page items
+
+2. Find lecture slides (look for PDF/File items)
+   → Items with type "File" and title matching lecture/slide patterns
+   → Note the content_id for each file
+
+3. Download the file
+   → download_course_file(course_id, content_id)
+   OR use the file's download URL
+
+4. For files with data-api-endpoint in page HTML
+   → get_page_content_with_files(course_id, page_url)
+   Returns: page content + extracted file URLs
+   → download_file_by_url(data_api_url)
+```
+
+#### Alternative: Check pages first (some courses use pages)
+```
+1. list_pages(course_id)
+   → Get page URLs
+
+2. get_page_content(course_id, page_url)
+   → Read page HTML
+
+3. If page has data-api-endpoint URLs:
+   → get_page_content_with_files(course_id, page_url)
+   → download_file_by_url(data_api_url)
+```
+
+#### Key insight
+- `get_course_structure` returns ALL module items with `content_id` and `type`
+- File items have `content_id` that works directly with `download_course_file`
+- Page items have `page_url` that works with `get_page_content`
+- Always prefer `get_course_structure` over `list_pages` for finding course materials
 
 ### Student: Weekly Planning
 ```
